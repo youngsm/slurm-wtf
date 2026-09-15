@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from importlib.resources import files
 
 from . import __version__
+from .favorites import favorites_path, read_favorites, set_favorite
 
 # ---------------------------------------------------------------------------
 # style
@@ -855,7 +856,7 @@ def account_label(account, partition, *, pool=False, parent=None, full_names=Fal
     return name
 
 
-def pool_groups(rows):
+def pool_groups(rows, favorites=(), cluster=""):
     groups = {}
     for row in rows:
         scopes = row["shared_limits"]
@@ -867,6 +868,7 @@ def pool_groups(rows):
     return sorted(
         groups.values(),
         key=lambda g: (
+            (cluster,) + pool_key(g) not in favorites,
             g["rows"][0]["partition"].casefold(),
             g["rows"][0]["partition"],
             g["scope"]["account"] if g["scope"] else g["rows"][0]["account"],
@@ -1275,10 +1277,11 @@ def pool_gpu_display(model, scope, members):
 
 def interactive_rows(model, args, expanded):
     entries = []
-    for group in pool_groups(select(model, args)):
+    for group in pool_groups(select(model, args), model.get("favorites", ()), model["cluster"]):
         part, account = pool_key(group)
         scope, members = group["scope"], group["rows"]
         res = members[0]["res"]
+        favorite = (model["cluster"], part, account) in model.get("favorites", ())
         if scope:
             name = account_label(
                 account, part, pool=True, full_names=getattr(args, "full_names", False)
@@ -1305,7 +1308,7 @@ def interactive_rows(model, args, expanded):
                     "parent": None,
                     "expandable": True,
                     "cells": [
-                        ("▾ " if key in expanded else "▸ ") + name,
+                        ("▾ " if key in expanded else "▸ ") + ("★ " if favorite else "") + name,
                         part,
                         "%s %s" % (fmt_n(scope["used"].get(res, 0)), UNIT[res]),
                         limit_display,
@@ -1343,7 +1346,7 @@ def interactive_rows(model, args, expanded):
             if scope:
                 name = ("  └─ " if i == len(members) - 1 else "  ├─ ") + name
             else:
-                name = "  " + name
+                name = "  " + ("★ " if favorite else "") + name
             own = row["own_caps"]
             dimension = row["primary"] or next(
                 (k for k in ("cpu", "node", "mem") if k in own), None
@@ -1650,6 +1653,13 @@ def interactive(args):
             ):
                 curses.init_pair(pair, foreground, background)
 
+        favorites_file = favorites_path(args.demo)
+        preference_error = ""
+        try:
+            favorites = read_favorites(favorites_file)
+        except (OSError, ValueError) as exc:
+            favorites = set()
+            preference_error = "Cannot read favorites: " + str(exc)
         updates = queue.Queue()
         model, error, busy = None, "", False
         expanded = set()
@@ -1690,6 +1700,8 @@ def interactive(args):
                 refresh()
                 busy = True
             height, columns = stdscr.getmaxyx()
+            if model is not None:
+                model["favorites"] = favorites
             entries = inline_rows(model, args, expanded, expanded_jobs) if model else []
             if selected_key is not None:
                 selected = next(
@@ -1795,7 +1807,7 @@ def interactive(args):
                 put(
                     height - 2,
                     2,
-                    "Enter jobs | Click/Space expand | Left collapse | r refresh | q quit",
+                    "Enter jobs | Space expand | x favorite | Left back | r refresh | q quit",
                 )
                 note = (
                     "NODE EQ ≈ max(GPU, CPU, host RAM share); actual packing can differ."
@@ -1805,8 +1817,8 @@ def interactive(args):
                 put(
                     height - 1,
                     2,
-                    error or note,
-                    curses.color_pair(3) if color and error else curses.A_DIM,
+                    error or preference_error or note,
+                    curses.color_pair(3) if color and (error or preference_error) else curses.A_DIM,
                 )
             stdscr.refresh()
             key = stdscr.getch()
@@ -1837,6 +1849,20 @@ def interactive(args):
                         selected = next(
                             i for i, r in enumerate(entries) if r["key"] == row["parent"]
                         )
+            elif row and key in (ord("x"), ord("X")):
+                parent_rows = {entry["key"]: entry for entry in entries}
+                pool_row = row
+                while pool_row["parent"] is not None:
+                    pool_row = parent_rows[pool_row["parent"]]
+                favorite_key = (model["cluster"],) + pool_row["key"]
+                try:
+                    favorites = set_favorite(
+                        favorites_file, favorite_key, favorite_key not in favorites
+                    )
+                except (OSError, ValueError) as exc:
+                    preference_error = "Cannot save favorites: " + str(exc)
+                else:
+                    preference_error = ""
             elif key in (curses.KEY_DOWN, ord("j")):
                 selected = min(max(0, len(entries) - 1), selected + 1)
             elif key in (curses.KEY_UP, ord("k")):

@@ -209,6 +209,14 @@ def test_unrestricted_membership_keeps_partition_usage_and_global_limits(generic
     assert {s["partition"] for s in result["shared_limits"]} == {"gpu", "cpu"}
     table_rows = interactive_rows(model, args, set())
     assert [r["cells"][1] for r in table_rows] == ["cpu", "gpu"]
+    gpu_key = table_rows[1]["key"]
+    model["favorites"] = {(model["cluster"],) + gpu_key}
+    favorite_rows = interactive_rows(model, args, set())
+    assert [r["cells"][1] for r in favorite_rows] == ["gpu", "cpu"]
+    assert favorite_rows[0]["key"] == gpu_key
+    assert "★" in favorite_rows[0]["cells"][0]
+    model["favorites"] = {("another-cluster",) + gpu_key}
+    assert [r["cells"][1] for r in interactive_rows(model, args, set())] == ["cpu", "gpu"]
     from slurm_wtf.cli import render
 
     args.no_jobs = True

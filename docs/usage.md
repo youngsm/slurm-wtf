@@ -46,7 +46,14 @@ wtf -w 30           # refresh every 30 seconds
 | Expand running jobs | Enter on a pool or account |
 | Collapse a branch | Left or Escape |
 | Move | Arrows, j/k, Page Up/Down, mouse wheel |
+| Favorite a pool/partition | x |
 | Refresh / quit | r / q |
+
+Press `x` on a pool to add or remove its star and pin it above other pools.
+Favorites stay alphabetically ordered by partition, followed by the other pools in alphabetical order.
+Pressing `x` within an expanded account or job favorites its enclosing pool.
+Favorites are saved by cluster, partition, and full account identifier in `$XDG_CONFIG_HOME/slurm-wtf/favorites.json` (default `~/.config/slurm-wtf/favorites.json`).
+The synthetic demo uses a separate favorites file.
 
 Jobs expand in place, with name, user, elapsed time, time limit, GPUs, and estimated node share.
 The selected job's footer shows its full name and account.
