@@ -1,0 +1,52 @@
+{
+  "cluster": "example",
+  "groups": [
+    "researchers"
+  ],
+  "mine": [
+    "training|gpu|batch|",
+    "analysis|gpu|batch|",
+    "compute|cpu|batch|"
+  ],
+  "quota": [
+    "root||||",
+    "research||node=2|batch|root",
+    "training||gres/gpu=4|batch|research",
+    "analysis||gres/gpu=8|batch|research",
+    "compute||cpu=128|batch|root"
+  ],
+  "access": [
+    "training|demo|gpu",
+    "analysis|demo|gpu",
+    "compute|demo|cpu"
+  ],
+  "partitions": [
+    "PartitionName=gpu AllowAccounts=research AllowGroups=researchers AllowQos=ALL State=UP",
+    "PartitionName=cpu AllowAccounts=ALL AllowGroups=ALL AllowQos=ALL State=UP"
+  ],
+  "usage": [
+    "ClusterName=example Account=root UserName= Partition= ID=1",
+    "    GrpTRES=cpu=N(88),node=N(3),gres/gpu=N(5)",
+    "ClusterName=example Account=research UserName= Partition= ID=1",
+    "    GrpTRES=cpu=N(72),node=2(2),gres/gpu=N(5)",
+    "ClusterName=example Account=training UserName= Partition= ID=1",
+    "    GrpTRES=cpu=N(64),node=N(2),gres/gpu=4(3)",
+    "ClusterName=example Account=analysis UserName= Partition= ID=1",
+    "    GrpTRES=cpu=N(8),node=N(1),gres/gpu=8(2)",
+    "ClusterName=example Account=compute UserName= Partition= ID=1",
+    "    GrpTRES=cpu=128(16),node=N(1),gres/gpu=N(0)"
+  ],
+  "jobs": [
+    "101|training|gpu|batch|R|demo|None|gres/gpu=2,cpu=16,mem=64G|3:00:00|train-transformer|1:00:00|4:00:00|gpu01|",
+    "102|training|gpu|batch|R|alice|None|gres/gpu=1,cpu=48,mem=128G|1:40:00|prepare-dataset|20:00|2:00:00|gpu02|",
+    "103|analysis|gpu|batch|R|bob|None|gres/gpu=2,cpu=8,mem=32G|UNLIMITED|evaluate|12:30|UNLIMITED|gpu02|",
+    "104|training|gpu|batch|PD|demo|AssocGrpNodeLimit|gres/gpu=4,cpu=32,mem=64G|4:00:00|next-training-run|0:00|4:00:00||",
+    "105|compute|cpu|batch|R|demo|None|cpu=16,mem=8G|45:00|simulation|15:00|1:00:00|cpu01|"
+  ],
+  "nodes": [
+    "gpu01|gpu|mixed|16/48/0/64|gpu:a100:4|gpu:a100:2(IDX:0-1)|262144|65536|",
+    "gpu02|gpu|mixed|56/8/0/64|gpu:4|gpu:3(IDX:0-2)|262144|163840|",
+    "cpu01|cpu|mixed|16/48/0/64|(null)|(null)|131072|8192|",
+    "cpu02|cpu|idle|0/64/0/64|(null)|(null)|131072|0|"
+  ]
+}
