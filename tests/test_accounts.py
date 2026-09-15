@@ -207,6 +207,8 @@ def test_unrestricted_membership_keeps_partition_usage_and_global_limits(generic
     args = SimpleNamespace(all_accounts=False, gpu_only=False, cpu_only=False, match=None)
     result = json.loads(to_json(model, args))
     assert {s["partition"] for s in result["shared_limits"]} == {"gpu", "cpu"}
+    table_rows = interactive_rows(model, args, set())
+    assert [r["cells"][1] for r in table_rows] == ["cpu", "gpu"]
     from slurm_wtf.cli import render
 
     args.no_jobs = True

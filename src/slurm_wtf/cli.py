@@ -867,8 +867,7 @@ def pool_groups(rows):
     return sorted(
         groups.values(),
         key=lambda g: (
-            g["rows"][0]["res"] != "gpu",
-            not any(r["verdict"][0] <= EVICT for r in g["rows"]),
+            g["rows"][0]["partition"].casefold(),
             g["rows"][0]["partition"],
             g["scope"]["account"] if g["scope"] else g["rows"][0]["account"],
         ),
@@ -945,7 +944,7 @@ def render(model, args, width):
         for (account, _partition), scope in sorted(
             shared.items(),
             key=lambda item: (
-                not model["parts"].get(item[1]["partition"], {}).get("is_gpu", False),
+                (item[1]["partition"] or "").casefold(),
                 item[1]["partition"] or "",
                 item[0],
             ),
@@ -1058,7 +1057,7 @@ def render(model, args, width):
         add(C.DIM + "  (nothing matches)" + C.RESET)
 
     partitions = sorted(
-        {r["partition"] for r in rows}, key=lambda name: (not model["parts"][name]["is_gpu"], name)
+        {r["partition"] for r in rows}, key=lambda name: (name.casefold(), name)
     )
     if partitions:
         add("")
