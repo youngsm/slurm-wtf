@@ -67,10 +67,12 @@ A zero estimate at an occupied-node limit does not rule out a smaller job fittin
 
 ## Cluster portability
 
-Account names are treated as names, with no required prefix, separator, partition suffix, or institution-specific convention.
+Account names require no prefix, separator, partition suffix, or institution-specific convention.
+Structured names are shortened for display, while full identifiers remain in selected-row details and JSON.
+Use `--full-names` to show exact identifiers in the table; label formatting never controls access, quotas, or job matching.
 Partitions come from Slurm associations and partition metadata.
 An association without a partition restriction is expanded over accessible partitions, respecting published account, group, and QoS access lists.
-Database queries are restricted to the current cluster, and controller counters retain partition scope.
+Database queries are restricted to the current cluster and relevant shared pools, and controller counters retain partition scope.
 CPU-only clusters and both typed and untyped GPU resources are supported.
 
 All users and QoS names count as ordinary usage by default.

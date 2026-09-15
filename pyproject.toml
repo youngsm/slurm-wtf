@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "slurm-wtf"
-version = "0.1.1"
+version = "0.1.2"
 description = "Where did the cluster capacity go? Interactive Slurm accounts, shared limits, and jobs."
 readme = "README.md"
 requires-python = ">=3.10"

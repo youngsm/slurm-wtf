@@ -280,3 +280,31 @@ def test_gpu_resources_accept_typed_and_untyped_forms(gres, expected):
     from slurm_wtf.cli import gres_count
 
     assert gres_count(gres) == expected
+
+
+def test_access_lookup_is_scoped_to_related_pools(generic_snapshot):
+    from slurm_wtf.cli import relevant_access_accounts
+
+    generic_snapshot["quota"] += [
+        "unrelated||node=100|batch|root",
+        "outsider||gres/gpu=400|batch|unrelated",
+    ]
+    related = relevant_access_accounts(["training|gpu|batch|"], generic_snapshot["quota"])
+    assert related == ["analysis", "research", "training"]
+
+
+@pytest.mark.parametrize(
+    "name,partition,pool,parent,expected",
+    [
+        ("team:_regular_@gpu", "gpu", True, None, "team"),
+        ("team:_preemptable_@gpu", "gpu", True, None, "team (preempt)"),
+        ("team:training@gpu", "gpu", False, "team:_regular_@gpu", "training"),
+        ("research", "gpu", True, None, "research"),
+        ("other:training@gpu", "gpu", False, "team:_regular_@gpu", "other:training"),
+    ],
+)
+def test_compact_labels_preserve_exact_identifiers(name, partition, pool, parent, expected):
+    from slurm_wtf.cli import account_label
+
+    assert account_label(name, partition, pool=pool, parent=parent) == expected
+    assert account_label(name, partition, pool=pool, parent=parent, full_names=True) == name

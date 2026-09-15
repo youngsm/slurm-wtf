@@ -252,15 +252,6 @@ def collect(user):
             "user=",
             "format=Account,Partition,GrpTRES,QOS,ParentName",
         ],
-        "access": [
-            "sacctmgr",
-            "-nP",
-            "show",
-            "assoc",
-            "where",
-            "cluster=" + cluster,
-            "format=Account,User,Partition",
-        ],
         "partitions": ["scontrol", "show", "partition", "-o"],
         "jobs": ["squeue", "--local", "-h", "-a", "-t", "all", "-O", JOB_FMT],
         "nodes": ["sinfo", "--local", "-h", "-N", "-O", NODE_FMT],
@@ -272,22 +263,59 @@ def collect(user):
     accounts = set()
     for row in split_rows(raw["mine"], 4):
         accounts.update(account_chain(row[0], parents))
-    raw["usage"] = (
-        sh(
-            [
-                "scontrol",
-                "show",
-                "assoc_mgr",
-                "accounts=" + ",".join(sorted(accounts)),
-                "flags=assoc",
-            ]
-        )
-        if accounts
-        else []
-    )
+    access_accounts = relevant_access_accounts(raw["mine"], raw["quota"])
+    detail_queries = {}
+    if accounts:
+        detail_queries["usage"] = [
+            "scontrol",
+            "show",
+            "assoc_mgr",
+            "accounts=" + ",".join(sorted(accounts)),
+            "flags=assoc",
+        ]
+    if access_accounts:
+        detail_queries["access"] = [
+            "sacctmgr",
+            "-nP",
+            "show",
+            "assoc",
+            "where",
+            "cluster=" + cluster,
+            "accounts=" + ",".join(access_accounts),
+            "format=Account,User,Partition",
+        ]
+    raw.update(usage=[], access=[])
+    with ThreadPoolExecutor(max_workers=max(1, len(detail_queries))) as pool:
+        futures = {key: pool.submit(sh, command) for key, command in detail_queries.items()}
+        raw.update({key: future.result() for key, future in futures.items()})
     raw["cluster"] = cluster
-    raw["groups"] = sh(["id", "-Gn", user])[0].split()
+    restricted_groups = any(
+        p.get("AllowGroups", "ALL") != "ALL" for p in parse_partitions(raw["partitions"]).values()
+    )
+    raw["groups"] = sh(["id", "-Gn", user])[0].split() if restricted_groups else []
     return raw
+
+
+def relevant_access_accounts(memberships, quotas):
+    """Request memberships only beneath the user's nearest quota-bearing pools."""
+    records = split_rows(quotas, 5)
+    parents = {row[0]: row[4] for row in records}
+    limited = {row[0] for row in records if row[2]}
+    children = defaultdict(list)
+    for account, parent in parents.items():
+        children[parent].append(account)
+    roots = set()
+    for account, _, _, _ in split_rows(memberships, 4):
+        chain = account_chain(account, parents)
+        roots.add(next((ancestor for ancestor in chain[1:] if ancestor in limited), account))
+    pending, related = list(roots), set()
+    while pending:
+        account = pending.pop()
+        if account in related:
+            continue
+        related.add(account)
+        pending.extend(children[account])
+    return sorted(related)
 
 
 def partition_access(raw, parents, parts):
@@ -806,6 +834,27 @@ def select(model, args):
     return rows
 
 
+def account_label(account, partition, *, pool=False, parent=None, full_names=False):
+    """Shorten display labels only; Slurm identifiers remain untouched."""
+    if full_names:
+        return account
+    suffix = "@" + partition
+    name = account[: -len(suffix)] if account.endswith(suffix) else account
+    if pool:
+        match = re.fullmatch(r"([^:]+):_([^:]+)_", name)
+        if match:
+            namespace, qualifier = match.groups()
+            if qualifier == "regular":
+                return namespace
+            qualifier = "preempt" if qualifier == "preemptable" else qualifier
+            return namespace + " (" + qualifier + ")"
+    if parent and ":" in parent:
+        prefix = parent.split(":", 1)[0] + ":"
+        if name.startswith(prefix):
+            return name[len(prefix) :]
+    return name
+
+
 def pool_groups(rows):
     groups = {}
     for row in rows:
@@ -901,8 +950,10 @@ def render(model, args, width):
                 item[0],
             ),
         ):
-            name = account
             part = scope["partition"] or "all"
+            name = account_label(
+                account, part, pool=True, full_names=getattr(args, "full_names", False)
+            )
             res = "gpu" if model["parts"].get(part, {}).get("is_gpu") else "cpu"
             members = [
                 r
@@ -1232,7 +1283,9 @@ def interactive_rows(model, args, expanded):
         scope, members = group["scope"], group["rows"]
         res = members[0]["res"]
         if scope:
-            name = account
+            name = account_label(
+                account, part, pool=True, full_names=getattr(args, "full_names", False)
+            )
             key = (part, account)
             caps = scope["caps"]
             dimension = next(
@@ -1284,7 +1337,12 @@ def interactive_rows(model, args, expanded):
                 continue
         for i, row in enumerate(members):
             key = (part, row["account"])
-            name = row["account"]
+            name = account_label(
+                row["account"],
+                part,
+                parent=account if scope else None,
+                full_names=getattr(args, "full_names", False),
+            )
             if scope:
                 name = ("  └─ " if i == len(members) - 1 else "  ├─ ") + name
             else:
@@ -1847,6 +1905,9 @@ def main(argv=None):
     )
     ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
     ap.add_argument("--demo", action="store_true", help="explore synthetic data without Slurm")
+    ap.add_argument(
+        "--full-names", action="store_true", help="show exact account identifiers in table labels"
+    )
     ap.add_argument(
         "--preemptible-qos",
         default=os.environ.get("SA_PREEMPTIBLE_QOS", ""),
