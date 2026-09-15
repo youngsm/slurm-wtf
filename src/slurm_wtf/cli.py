@@ -1056,9 +1056,7 @@ def render(model, args, width):
     else:
         add(C.DIM + "  (nothing matches)" + C.RESET)
 
-    partitions = sorted(
-        {r["partition"] for r in rows}, key=lambda name: (name.casefold(), name)
-    )
+    partitions = sorted({r["partition"] for r in rows}, key=lambda name: (name.casefold(), name))
     if partitions:
         add("")
         add(rule("CLUSTER HARDWARE", width))
