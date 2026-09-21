@@ -126,9 +126,11 @@ On heterogeneous partitions, GPU-node equivalents and job shares are estimates b
 ## Release notifications
 
 Live interactive and plain output automatically check PyPI for a newer installable
-stable release. The interactive check runs in the background; results (including
-failed attempts) are cached for 24 hours in `$XDG_CACHE_HOME/slurm-wtf/update-check.json`
-(default `~/.cache/slurm-wtf/update-check.json`). Offline failures are silent.
+stable release. The interactive check runs in the background. An up-to-date result
+is cached for one hour, an available-version notice for 24 hours, and a failed
+attempt for five minutes in `$XDG_CACHE_HOME/slurm-wtf/update-check.json` (default
+`~/.cache/slurm-wtf/update-check.json`). Offline failures are silent. The checker
+uses the host CA bundle when an isolated Python runtime cannot find it.
 Demo and JSON output never trigger automatic checks. Plain snapshots print any
 notice to stderr after the report, waiting at most two additional seconds.
 
