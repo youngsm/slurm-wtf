@@ -40,7 +40,7 @@ def test_latest_installable_stable_release_and_cache(monkeypatch):
     assert updates.check_release() == ("0.10.0", "")
     assert updates.check_release() == ("0.10.0", "")
     assert calls == [(updates.INDEX_URL, 2)]
-    assert "uv tool upgrade slurm-wtf" in updates.release_notice("0.10.0")
+    assert updates.release_notice("0.10.0") == "slurm-wtf 0.10.0 available (installed 0.2.0)"
     updates.check_release(force=True)
     assert len(calls) == 2
 

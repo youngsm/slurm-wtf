@@ -77,7 +77,7 @@ def check_release(force=False):
 def release_notice(latest):
     current, available = stable_version(__version__), stable_version(latest)
     if current and available and available > current:
-        return f"slurm-wtf {latest} available (installed {__version__}) · uv tool upgrade slurm-wtf"
+        return f"slurm-wtf {latest} available (installed {__version__})"
     return ""
 
 
