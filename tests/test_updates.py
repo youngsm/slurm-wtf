@@ -1,5 +1,6 @@
 import io
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,9 +20,11 @@ def response(*versions):
 
 def test_latest_installable_stable_release_and_cache(monkeypatch):
     calls = []
+    context = object()
+    monkeypatch.setattr(updates, "tls_context", lambda: context)
 
-    def fetch(request, timeout):
-        calls.append((request.full_url, timeout))
+    def fetch(request, timeout, context):
+        calls.append((request.full_url, timeout, context))
         return io.StringIO(
             json.dumps(
                 {
@@ -39,7 +42,7 @@ def test_latest_installable_stable_release_and_cache(monkeypatch):
     monkeypatch.setattr(updates, "urlopen", fetch)
     assert updates.check_release() == ("0.10.0", "")
     assert updates.check_release() == ("0.10.0", "")
-    assert calls == [(updates.INDEX_URL, 2)]
+    assert calls == [(updates.INDEX_URL, 2, context)]
     assert updates.release_notice("0.10.0") == "slurm-wtf 0.10.0 available (installed 0.2.0)"
     updates.check_release(force=True)
     assert len(calls) == 2
@@ -50,7 +53,7 @@ def test_no_notice_for_current_older_or_invalid_versions(version):
     assert updates.release_notice(version) == ""
 
 
-def test_offline_cached_and_retried_after_a_day(monkeypatch):
+def test_offline_cached_and_retried_after_five_minutes(monkeypatch):
     calls = []
 
     def offline(*args, **kwargs):
@@ -61,9 +64,46 @@ def test_offline_cached_and_retried_after_a_day(monkeypatch):
     assert "offline" in updates.check_release()[1]
     assert updates.check_release() == (None, "")
     assert len(calls) == 1
-    monkeypatch.setattr(updates.time, "time", lambda: 1000000 + updates.CACHE_SECONDS)
+    monkeypatch.setattr(updates.time, "time", lambda: 1000000 + updates.FAILURE_CACHE_SECONDS)
     updates.check_release()
     assert len(calls) == 2
+
+
+def test_up_to_date_result_is_refreshed_after_an_hour(monkeypatch):
+    replies = iter((response("0.2.0"), response("0.2.0", "0.3.0")))
+    calls = []
+
+    def fetch(*args, **kwargs):
+        calls.append(1)
+        return next(replies)
+
+    monkeypatch.setattr(updates, "urlopen", fetch)
+    assert updates.check_release() == ("0.2.0", "")
+    monkeypatch.setattr(updates.time, "time", lambda: 1000000 + updates.CURRENT_CACHE_SECONDS - 1)
+    assert updates.check_release() == ("0.2.0", "")
+    assert len(calls) == 1
+    monkeypatch.setattr(updates.time, "time", lambda: 1000000 + updates.CURRENT_CACHE_SECONDS)
+    assert updates.check_release() == ("0.3.0", "")
+    assert len(calls) == 2
+
+
+def test_tls_context_falls_back_to_host_ca_bundle(tmp_path, monkeypatch):
+    bundle = tmp_path / "ca-bundle.crt"
+    bundle.write_text("certificate data")
+    monkeypatch.setattr(updates, "CA_BUNDLES", (str(bundle),))
+    monkeypatch.setattr(
+        updates.ssl, "get_default_verify_paths", lambda: SimpleNamespace(cafile=None)
+    )
+    calls = []
+    context = object()
+
+    def create_default_context(**kwargs):
+        calls.append(kwargs)
+        return context
+
+    monkeypatch.setattr(updates.ssl, "create_default_context", create_default_context)
+    assert updates.tls_context() is context
+    assert calls == [{"cafile": str(bundle)}]
 
 
 def test_stale_known_release_survives_network_failure(monkeypatch):
