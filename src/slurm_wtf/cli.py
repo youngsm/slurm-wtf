@@ -1030,11 +1030,7 @@ def render(model, args, width):
             if row["unknown_usage"]:
                 offer_s = C.WARN + "unknown" + C.RESET
             elif offer:
-                suffix = (
-                    " p"
-                    if not row["has_normal"]
-                    else (" q" if rank == TIGHT else (" e" if rank == EVICT else ""))
-                )
+                suffix = " p" if not row["has_normal"] else (" q" if rank == TIGHT else "")
                 offer_s = color + "%s %s%s" % (fmt_n(offer), UNIT[row["res"]], suffix) + C.RESET
             elif rank == PREEMPTONLY and row["phys_free"] >= 1:
                 offer_s = C.WARN + "borrow p" + C.RESET
@@ -1062,8 +1058,6 @@ def render(model, args, width):
         markers = []
         if any(" p" in cell for record in records for cell in record):
             markers.append("p = preemptable")
-        if any(r["verdict"][0] == EVICT for r in rows):
-            markers.append("e = evicts preemptable")
         if any(r["has_normal"] and r["verdict"][0] == TIGHT and r["verdict"][4] for r in rows):
             markers.append("q = queued demand")
         if markers:
@@ -1396,11 +1390,7 @@ def interactive_rows(model, args, expanded):
             if row["unknown_usage"]:
                 remaining = "unknown"
             elif offer:
-                remaining += (
-                    " p"
-                    if not row["has_normal"]
-                    else (" q" if rank == TIGHT else (" e" if rank == EVICT else ""))
-                )
+                remaining += " p" if not row["has_normal"] else (" q" if rank == TIGHT else "")
             elif rank == PREEMPTONLY and row["phys_free"] >= 1:
                 remaining = "borrow p"
             entries.append(
