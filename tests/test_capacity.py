@@ -47,6 +47,7 @@ def test_reclaimable_capacity_counts_with_or_without_idle_gpus(capacity_snapshot
     args = SimpleNamespace(all_accounts=False, gpu_only=False, cpu_only=False, match=None)
     pool = interactive_rows(model, args, set())[0]
     assert pool["available"] == idle + 12
+    assert pool["cells"][4] == f"{idle + 12} GPU"
     assert "reclaimable" in pool["detail"]
 
 
