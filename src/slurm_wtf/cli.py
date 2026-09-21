@@ -17,6 +17,8 @@ from importlib.resources import files
 
 from . import __version__
 from .favorites import favorites_path, read_favorites, set_favorite
+from .settings import read_filler_users, save_filler_users
+from .updates import TIMEOUT, UpdateCheck, check_release, release_notice
 
 # ---------------------------------------------------------------------------
 # style
@@ -219,8 +221,7 @@ def account_chain(account, parents):
     return chain
 
 
-def collect(user):
-    """Query the current cluster, including memberships without partition restrictions."""
+def current_cluster():
     config = sh(["scontrol", "show", "config"])
     cluster = next(
         (
@@ -232,6 +233,12 @@ def collect(user):
     )
     if not cluster:
         raise SystemExit("scontrol did not report a ClusterName")
+    return cluster
+
+
+def collect(user):
+    """Query the current cluster, including memberships without partition restrictions."""
+    cluster = current_cluster()
     cmds = {
         "mine": [
             "sacctmgr",
@@ -563,13 +570,6 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
                 }
             )
 
-    # sinfo counts filler allocations as busy; they are not.
-    for pn, f in part_filler.items():
-        if pn in parts:
-            for res in ("gpu", "cpu"):
-                parts[pn][res + "_used"] = max(0.0, parts[pn][res + "_used"] - f[res])
-                parts[pn][res + "_filler"] = f[res]
-
     # Node-equivalent free capacity, partition-wide: however many whole nodes'
     # worth of the primary device this partition's free devices add up to.
     # "Open nodes" regardless of whose account could claim them.
@@ -700,7 +700,7 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
                 "mine_run": mine_run.get((acct, part), zero()),
                 "mine_pend": mine_pend.get((acct, part), zero()),
                 "phys_free": pinfo[res] - pinfo[res + "_used"],
-                "reclaim": part_preempt[part][res],
+                "reclaim": part_preempt[part][res] + part_filler[part][res],
                 "per_node": pinfo["density"],
                 "part": pinfo,
                 "has_normal": not qos or any(q not in preemptible_qos for q in qos.split(",")),
@@ -725,6 +725,7 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
         "cluster": raw.get("cluster", ""),
         "part_preempt": part_preempt,
         "part_filler": part_filler,
+        "filler_users": list(ignore_users),
         "user": user,
     }
 
@@ -745,6 +746,15 @@ def verdict(r):
         return (NONE, "?", "usage unavailable: " + ", ".join(r["unknown_usage"]), C.WARN, 0)
     if not caps:
         available = max(0.0, r["phys_free"])
+        if r["has_normal"] and r["reclaim"]:
+            return (
+                EVICT,
+                "◕",
+                "%s %s available · includes reclaimable jobs"
+                % (fmt_n(available + r["reclaim"]), unit),
+                C.OK,
+                available + r["reclaim"],
+            )
         rank = GO if available and r["has_normal"] else PREEMPTONLY if available else TIGHT
         return (
             rank,
@@ -770,7 +780,7 @@ def verdict(r):
     if "node" in caps and r["per_node"]:
         free = min(free, caps["node"]["free"] * r["per_node"])
     if free == float("inf"):
-        free = r["phys_free"]
+        free = max(0.0, r["phys_free"]) + (r["reclaim"] if r["has_normal"] else 0)
     if not r["has_normal"]:
         # Quota exists but the association only carries the preemptable QOS.
         return (
@@ -779,7 +789,7 @@ def verdict(r):
             "%s %s free · preemptable qos only"
             % (fmt_n(min(free, r["phys_free"])) if r["phys_free"] >= 1 else fmt_n(free), unit),
             C.WARN,
-            min(free, r["phys_free"]),
+            min(free, max(0.0, r["phys_free"])),
         )
     available = min(free, max(0.0, r["phys_free"]) + r["reclaim"])
     if r["pending"]["jobs"] and r["pending"][res] >= free:
@@ -791,6 +801,14 @@ def verdict(r):
             C.WARN,
             available,
         )
+    if available > min(free, max(0.0, r["phys_free"])):
+        return (
+            EVICT,
+            "◕",
+            "%s %s available · includes reclaimable jobs" % (fmt_n(available), unit),
+            C.OK,
+            available,
+        )
     if r["phys_free"] >= 1:
         return (
             GO,
@@ -798,14 +816,6 @@ def verdict(r):
             "%s %s free now" % (fmt_n(min(free, r["phys_free"])), unit),
             C.OK,
             min(free, r["phys_free"]),
-        )
-    if r["reclaim"] >= 1:
-        return (
-            EVICT,
-            "◕",
-            "%s %s free · evicts preemptable" % (fmt_n(available), unit),
-            C.OK,
-            available,
         )
     return (TIGHT, "◑", "%s %s in quota · partition full" % (fmt_n(free), unit), C.WARN, 0)
 
@@ -989,9 +999,12 @@ def render(model, args, width):
                         col + C.BOLD + "%s %s" % (fmt_n(cap["free"]), UNIT[key]) + C.RESET,
                     ]
                 )
-        L.extend(
-            table(["POOL", "PARTITION", "IN USE", "USED / SHARED LIMIT", "EST. FREE"], records)
-        )
+        L.extend(table(["POOL", "PARTITION", "IN USE", "QUOTA USAGE", "EST. NOW"], records))
+        for group in groups:
+            if group["scope"]:
+                account = group["scope"]["account"]
+                add("  %s: %s" % (account, availability_detail(group["rows"])))
+        add("  Quota is a ceiling, not reserved hardware; GPU quota usage is in node equivalents.")
 
     add("")
     add(rule("ACCOUNTS", width))
@@ -1077,7 +1090,7 @@ def render(model, args, width):
         L.extend(table(["PARTITION", "DEVICE", "USED / ONLINE", "IDLE"], records))
         add(
             C.DIM
-            + "  Cluster idle capacity is shared by all pools; filler jobs count as idle."
+            + "  Idle hardware is shared by all pools; filler allocations are reclaimable."
             + C.RESET
         )
 
@@ -1130,6 +1143,7 @@ def to_json(model, args):
     out = {
         "user": model["user"],
         "cluster": model["cluster"],
+        "filler_users": model["filler_users"],
         "generated": time.time(),
         "accounts": [],
         "partitions": [],
@@ -1275,6 +1289,19 @@ def pool_gpu_display(model, scope, members):
     return limit, "%s GPU" % fmt_n(available), available
 
 
+def availability_detail(members):
+    """Explain the hardware bound alongside the best attached account's status."""
+    best = max(members, key=lambda row: row["verdict"][4])
+    unit = UNIT[best["res"]]
+    return "Partition: %s idle + %s reclaimable / %s %s · %s" % (
+        fmt_n(max(0, best["phys_free"])),
+        fmt_n(best["reclaim"]),
+        fmt_n(best["part"][best["res"]]),
+        unit,
+        best["verdict"][2],
+    )
+
+
 def interactive_rows(model, args, expanded):
     entries = []
     for group in pool_groups(select(model, args), model.get("favorites", ()), model["cluster"]):
@@ -1317,8 +1344,9 @@ def interactive_rows(model, args, expanded):
                         "%d/%d" % (my_run, my_pending),
                     ],
                     "available": available,
-                    "detail": "%s · %d attached account%s"
-                    % (account, len(members), "" if len(members) == 1 else "s")
+                    "detail": availability_detail(members)
+                    + " · "
+                    + account
                     + (
                         " · quota shared across " + ", ".join(scope["shared_partitions"])
                         if len(scope["shared_partitions"]) > 1
@@ -1390,7 +1418,7 @@ def interactive_rows(model, args, expanded):
                         "%d/%d" % (row["mine_run"]["jobs"], row["mine_pend"]["jobs"]),
                     ],
                     "available": offer,
-                    "detail": "%s · %s" % (row["account"], status),
+                    "detail": availability_detail([row]) + " · " + row["account"],
                     "limits": "Own limits: "
                     + (
                         " · ".join(
@@ -1621,7 +1649,7 @@ def column_widths(headers, rows, space):
     return widths
 
 
-def interactive(args):
+def interactive(args, update_check=None):
     import curses
     import queue
     import threading
@@ -1671,7 +1699,11 @@ def interactive(args):
         def refresh():
             def fetch():
                 try:
-                    ignore = tuple(u for u in args.ignore_users.split(",") if u)
+                    ignore = (
+                        tuple(u.strip() for u in args.ignore_users.split(",") if u.strip())
+                        if args.ignore_users is not None
+                        else None
+                    )
                     result = load_model(args, ignore)
                 except (Exception, SystemExit) as exc:
                     updates.put((None, str(exc)))
@@ -1723,7 +1755,7 @@ def interactive(args):
                 put(2, 1, "Resize to at least 60 columns and 12 rows; q quits.")
                 visible = 0
             else:
-                headers = ["POOL / ACCOUNT", "PARTITION", "IN USE", "USED / LIMIT", "EST. FREE"]
+                headers = ["POOL / ACCOUNT", "PARTITION", "IN USE", "QUOTA USAGE", "EST. NOW"]
                 if columns >= 100:
                     headers += ["QUEUE", "MY R/P"]
                 all_keys = (
@@ -1801,7 +1833,7 @@ def interactive(args):
                     2,
                     entries[selected]["identity"]
                     if entries and entries[selected]["kind"] == "job"
-                    else "",
+                    else "Quota is not reserved hardware; GPU quota usage is in node equivalents.",
                     curses.A_DIM,
                 )
                 put(
@@ -1817,7 +1849,10 @@ def interactive(args):
                 put(
                     height - 1,
                     2,
-                    error or preference_error or note,
+                    error
+                    or preference_error
+                    or (update_check.notice if update_check else "")
+                    or note,
                     curses.color_pair(3) if color and (error or preference_error) else curses.A_DIM,
                 )
             stdscr.refresh()
@@ -1913,6 +1948,8 @@ def load_model(args, ignore):
         if args.demo
         else collect(args.user)
     )
+    if ignore is None:
+        ignore = () if args.demo else read_filler_users(raw["cluster"])
     return build(
         raw,
         "demo" if args.demo else args.user,
@@ -1927,6 +1964,13 @@ def main(argv=None):
         description="Where did the cluster capacity go? Slurm accounts, shared limits, and running jobs.",
     )
     ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
+    update_options = ap.add_mutually_exclusive_group()
+    update_options.add_argument(
+        "--check-updates", action="store_true", help="check PyPI for a stable release and exit"
+    )
+    update_options.add_argument(
+        "--no-update-check", action="store_true", help="disable automatic release notifications"
+    )
     ap.add_argument("--demo", action="store_true", help="explore synthetic data without Slurm")
     ap.add_argument(
         "--full-names", action="store_true", help="show exact account identifiers in table labels"
@@ -1966,16 +2010,43 @@ def main(argv=None):
     ap.add_argument("-J", "--no-jobs", action="store_true", help="hide your job list")
     ap.add_argument("--max-jobs", type=int, default=15, help="cap the job list (default 15)")
     ap.add_argument(
+        "--save-filler-users",
+        metavar="U1,U2",
+        help="save reclaimable filler users for the current cluster and exit (empty clears)",
+    )
+    ap.add_argument(
         "--ignore-users",
-        default=os.environ.get("SA_IGNORE_USERS", ",".join(FILLER_USERS)),
+        default=os.environ.get("SA_IGNORE_USERS"),
         metavar="U1,U2",
         help="users whose jobs should count as reclaimable capacity "
-        "(default: %s; env SA_IGNORE_USERS)" % ",".join(FILLER_USERS),
+        "(default: saved cluster setting, otherwise none; env SA_IGNORE_USERS; empty disables)",
     )
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--plain", action="store_true", help="print a noninteractive snapshot")
     args = ap.parse_args(argv)
+    if args.save_filler_users is not None:
+        if args.json or args.demo or args.check_updates:
+            ap.error(
+                "--save-filler-users cannot be combined with --json, --demo or --check-updates"
+            )
+        cluster = current_cluster()
+        users = [u.strip() for u in args.save_filler_users.split(",") if u.strip()]
+        path = save_filler_users(cluster, users)
+        print("Filler users for %s: %s (saved in %s)" % (cluster, ", ".join(users) or "none", path))
+        return 0
+    if args.check_updates:
+        if args.json:
+            ap.error("--check-updates cannot be combined with --json")
+        latest, error = check_release(force=True)
+        notice = release_notice(latest)
+        if error:
+            print(error, file=sys.stderr)
+            if notice:
+                print(notice)
+            return 1
+        print(notice or "slurm-wtf %s is up to date (latest stable: %s)." % (__version__, latest))
+        return 0
     if args.match:
         try:
             re.compile(args.match)
@@ -1985,6 +2056,16 @@ def main(argv=None):
     if args.no_color or os.environ.get("NO_COLOR") or (not args.json and not sys.stdout.isatty()):
         C.strip()
 
+    update_check = (
+        UpdateCheck()
+        if not (
+            args.no_update_check
+            or os.environ.get("SLURM_WTF_NO_UPDATE_CHECK")
+            or args.demo
+            or args.json
+        )
+        else None
+    )
     if (
         not args.json
         and not args.plain
@@ -1992,10 +2073,14 @@ def main(argv=None):
         and sys.stdout.isatty()
         and os.environ.get("TERM", "dumb") != "dumb"
     ):
-        return interactive(args)
+        return interactive(args, update_check)
 
     def frame():
-        ignore = tuple(u for u in args.ignore_users.split(",") if u)
+        ignore = (
+            tuple(u.strip() for u in args.ignore_users.split(",") if u.strip())
+            if args.ignore_users is not None
+            else None
+        )
         model = load_model(args, ignore)
         if args.json:
             return to_json(model, args)
@@ -2004,6 +2089,10 @@ def main(argv=None):
 
     if args.watch is None or args.json:
         print(frame())
+        if update_check:
+            update_check.thread.join(timeout=TIMEOUT)
+            if update_check.notice:
+                print(update_check.notice, file=sys.stderr)
         return 0
 
     interval = max(2, args.watch)
@@ -2012,6 +2101,8 @@ def main(argv=None):
         while True:
             body = frame()
             sys.stdout.write("\033[H\033[2J" + body)
+            if update_check and update_check.notice:
+                sys.stdout.write("\n " + update_check.notice)
             sys.stdout.write(
                 "\n %srefreshing every %ds · ctrl-c to quit%s\n" % (C.DIM, interval, C.RESET)
             )

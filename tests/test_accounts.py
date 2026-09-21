@@ -244,7 +244,8 @@ def test_qos_names_and_ignored_users_are_opt_in(generic_snapshot):
     configured = build(
         generic_snapshot, "demo", ignore_users=("alice",), preemptible_qos=("batch",)
     )
-    assert configured["parts"]["gpu"]["gpu_used"] == 4
+    assert configured["parts"]["gpu"]["gpu_used"] == 5
+    assert configured["part_filler"]["gpu"]["gpu"] == 1
     assert configured["part_preempt"]["gpu"]["gpu"] == 4
     assert not any(r["has_normal"] for r in configured["rows"])
 
