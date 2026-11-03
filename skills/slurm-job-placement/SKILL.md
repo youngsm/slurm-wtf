@@ -38,10 +38,11 @@ Join each account row to its partition row by the `partition` field, then apply 
 1. Reject rows whose `primary_resource` does not match the job, whose `unknown_usage` is nonempty, or whose `offer_now` is smaller than the requested GPU or CPU count.
 2. For GPU work, reject partitions whose `gpu_models` cannot satisfy an explicitly requested model. Treat the model names reported by Slurm as cluster-defined labels; do not guess that two labels are equivalent.
 3. When the job requests whole nodes, require `offer_now_nodes` to meet the node count. `gpu_models` reports partition totals, so do not use it to infer exact GPUs per node; call out topology as an unresolved scheduler constraint when it matters.
-4. Prefer capacity covered by `partition_free`. Capacity beyond that value and up to `partition_free + partition_reclaimable` may require reclaiming configured filler or preemptible jobs; label this clearly.
-5. Among fitting rows, prefer lower `pending_jobs_in_account`, lower partition `pending_demand`, and then more headroom in `offer_now`. Use `status` to explain quota or shared-limit pressure.
-6. Treat accounts connected by the same entry in `shared_limits` as alternate ways into one shared pool. Recommend one of them; never add their offers together.
-7. Use `open_nodes` only as supporting evidence. It is a fractional estimate and does not prove that a job's exact CPU, memory, GPU topology, or wall-time request fits.
+4. Prefer capacity covered by `partition_free`. Capacity beyond that value and up to `partition_free + partition_reclaimable` may require reclaiming configured filler or preemptible jobs; label this clearly. When `reclaim_via_qos` is nonempty, reclaiming relies on Slurm preemption by one of those QoS, so include `--qos=<that QoS>` in the submission fragment.
+5. Check `preemptible_qos`: a job submitted under one of those QoS can itself be preempted. For long or non-checkpointing jobs, prefer an account and QoS outside that list, and say so when the only fitting option is preemptible.
+6. Among fitting rows, prefer lower `pending_jobs_in_account`, lower partition `pending_demand`, and then more headroom in `offer_now`. Use `status` to explain quota or shared-limit pressure.
+7. Treat accounts connected by the same entry in `shared_limits` as alternate ways into one shared pool. Recommend one of them; never add their offers together.
+8. Use `open_nodes` only as supporting evidence. It is a fractional estimate and does not prove that a job's exact CPU, memory, GPU topology, or wall-time request fits.
 
 If no row fits, say which constraint blocks the request and show the nearest candidates. Do not recommend splitting one job across unrelated accounts or partitions unless the workload itself can be split and the user asks for that option.
 
@@ -53,6 +54,7 @@ Lead with the best account and partition and include:
 - `offer_now`, including how much is truly idle versus reclaimable;
 - GPU model for GPU work;
 - queued demand or shared-limit pressure that affected the choice;
+- whether the job would be preemptible under the recommended QoS;
 - one fallback when a credible alternative exists.
 
 Provide a submission fragment without fabricating unspecified resource flags:
