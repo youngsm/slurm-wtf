@@ -25,6 +25,7 @@ uvx --from slurm-wtf wtf --demo
 
 Requires Python 3.10+ and a POSIX terminal.
 Live mode also requires `sacctmgr`, `scontrol`, `squeue`, `sinfo`, and access to the cluster's accounting information.
+QoS preemption details come from `sacctmgr show qos`; if it is unreadable, preemption is shown as unknown.
 The package has no Python runtime dependencies.
 
 ## Explore
@@ -55,8 +56,8 @@ Pressing `x` within an expanded account or job favorites its enclosing pool.
 Favorites are saved by cluster, partition, and full account identifier in `$XDG_CONFIG_HOME/slurm-wtf/favorites.json` (default `~/.config/slurm-wtf/favorites.json`).
 The synthetic demo uses a separate favorites file.
 
-Jobs expand in place, with name, user, elapsed time, time limit, GPUs, and estimated node share.
-The selected job's footer shows its full name and account.
+Jobs expand in place, with name, user, elapsed time, time limit, GPUs, estimated node share, and whether the job can be preempted.
+The selected job's footer shows its full name, account, and which QoS or partition can preempt it.
 Redirected output is automatically noninteractive.
 `--no-color` and `NO_COLOR` disable colors.
 
@@ -66,11 +67,25 @@ Redirected output is automatically noninteractive.
 - **QUOTA USAGE:** GPU-node equivalents for GPU partitions, respecting child GPU ceilings and shared ancestors.
 - **EST. NOW:** a conservative estimate through an attached account, constrained by account quotas and idle plus configured reclaimable hardware. The selected row shows both idle and reclaimable counts for the whole partition.
 - **NODE EQ:** a job's largest GPU, CPU, or host-RAM share of its assigned nodes.
+- **PREEMPT?:** `yes` when Slurm's configuration lets another job preempt this one, `no` when it does not, `filler` for configured filler users, and `?` when the QoS table cannot be read. The plain snapshot marks your own preemptible jobs in YOUR JOBS.
 
 Four GPUs on four-GPU hosts equal one GPU-node equivalent, even if the placement allowance permits using two separate hosts.
 Shared child quotas are never added beyond the parent ceiling.
 Pool estimates use the best attached-account offer; do not add pool and child estimates together.
 Quota is a ceiling, not reserved hardware: a pool using 7 of 28 GPU equivalents can still have no idle hardware available. Configured filler jobs contribute reclaimable capacity, including when some GPUs are already idle. Node limits are separate from GPU-node equivalents and can further constrain the estimate.
+
+## Preemption
+
+Preemptibility is read from Slurm, never guessed from QoS or partition names:
+
+- `PreemptType=preempt/qos`: a job is preemptible when another QoS lists its QoS in `Preempt` (`sacctmgr show qos`).
+- `PreemptType=preempt/partition_prio`: a job is preemptible when a partition with a higher `PriorityTier` shares its nodes.
+- The preempted job's QoS `PreemptMode`, then its partition's, then the cluster's decides the mechanism; `OFF` (or `GANG` alone) means not preemptible.
+
+Running jobs that one of your association's QoS, or your higher-tier partition, can preempt count as reclaimable in EST. NOW, alongside configured filler users and `--preemptible-qos`.
+Reclaiming through QoS preemption may require submitting with that QoS (`--qos`); JSON lists it per account as `reclaim_via_qos`.
+`preemptible_qos` lists the account's QoS under which your own job could be preempted, and `my_jobs` reports each of your jobs' preemptibility.
+Slurm still applies `PreemptExemptTime`, priorities, and placement when deciding whether to preempt, so treat reclaimable capacity as an estimate.
 
 ## Cluster portability
 
@@ -82,8 +97,8 @@ An association without a partition restriction is expanded over accessible parti
 Database queries are restricted to the current cluster and relevant shared pools, and controller counters retain partition scope.
 CPU-only clusters and both typed and untyped GPU resources are supported.
 
-All users and QoS names count as ordinary usage by default.
-If your administrators confirm that certain jobs are reclaimable, configure that explicitly:
+Beyond Slurm's own preemption configuration, all users and QoS names count as ordinary usage by default.
+If your administrators confirm that other jobs are reclaimable, configure that explicitly:
 
 ```bash
 wtf --preemptible-qos scavenger,spot
@@ -110,7 +125,8 @@ Demo mode does not load these settings. Filler jobs remain visible in job lists.
 Idle and reclaimable GPUs are reported separately; filler allocations are not
 subtracted from the actual allocated GPU/CPU counts. In JSON, `partition_free`
 and partition `open_nodes` describe truly idle hardware; `partition_reclaimable`
-includes configured filler and preemptible QoS allocations, without double counting.
+includes configured filler and preemptible QoS allocations and jobs that Slurm lets
+that account preempt, without double counting.
 Account and shared limits still apply to the combined estimate.
 
 ## Limits of an estimate

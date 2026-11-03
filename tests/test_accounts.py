@@ -238,11 +238,12 @@ def test_partition_access_uses_ancestors_and_custom_qos(generic_snapshot):
 
 
 def test_qos_names_and_ignored_users_are_opt_in(generic_snapshot):
+    generic_snapshot["preempt"] = {"type": "preempt/none", "mode": "OFF"}
     model = build(generic_snapshot, "demo")
     assert model["part_preempt"]["gpu"]["gpu"] == 0
     assert model["parts"]["gpu"]["gpu_used"] == 5
     configured = build(
-        generic_snapshot, "demo", ignore_users=("alice",), preemptible_qos=("batch",)
+        generic_snapshot, "demo", ignore_users=("alice",), preemptible_qos=("batch", "scavenger")
     )
     assert configured["parts"]["gpu"]["gpu_used"] == 5
     assert configured["part_filler"]["gpu"]["gpu"] == 1

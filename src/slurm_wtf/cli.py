@@ -221,16 +221,18 @@ def account_chain(account, parents):
     return chain
 
 
-def current_cluster():
-    config = sh(["scontrol", "show", "config"])
-    cluster = next(
-        (
-            line.split("=", 1)[1].strip()
-            for line in config
-            if line.strip().startswith("ClusterName") and "=" in line
-        ),
-        None,
-    )
+def read_config():
+    """`scontrol show config` as {key: value}."""
+    config = {}
+    for line in sh(["scontrol", "show", "config"]):
+        if "=" in line:
+            key, value = line.split("=", 1)
+            config.setdefault(key.strip(), value.strip())
+    return config
+
+
+def current_cluster(config=None):
+    cluster = (config if config is not None else read_config()).get("ClusterName")
     if not cluster:
         raise SystemExit("scontrol did not report a ClusterName")
     return cluster
@@ -238,7 +240,9 @@ def current_cluster():
 
 def collect(user):
     """Query the current cluster, including memberships without partition restrictions."""
-    cluster = current_cluster()
+    config = read_config()
+    cluster = current_cluster(config)
+    preempt_type = config.get("PreemptType", "preempt/none")
     cmds = {
         "mine": [
             "sacctmgr",
@@ -264,9 +268,20 @@ def collect(user):
         "jobs": ["squeue", "--local", "-h", "-a", "-t", "all", "-O", JOB_FMT],
         "nodes": ["sinfo", "--local", "-h", "-N", "-O", NODE_FMT],
     }
+    if "qos" in preempt_type:
+        cmds["qos"] = ["sacctmgr", "-nP", "show", "qos", "format=Name,Preempt,PreemptMode"]
     with ThreadPoolExecutor(max_workers=len(cmds)) as pool:
         futs = {k: pool.submit(sh, v) for k, v in cmds.items()}
-        raw = {k: f.result() for k, f in futs.items()}
+        raw = {}
+        for k, f in futs.items():
+            try:
+                raw[k] = f.result()
+            except SystemExit:
+                # Preemption detail is optional: unreadable QoS means "unknown".
+                if k != "qos":
+                    raise
+                raw[k] = None
+    raw["preempt"] = {"type": preempt_type, "mode": config.get("PreemptMode", "OFF")}
     parents = {r[0]: r[4] for r in split_rows(raw["quota"], 5)}
     accounts = set()
     for row in split_rows(raw["mine"], 4):
@@ -375,6 +390,119 @@ def allowed_partition(account, qos, partition, parents, groups):
     return partition.get("State", "UP") != "DOWN"
 
 
+# ---------------------------------------------------------------------------
+# preemption
+# ---------------------------------------------------------------------------
+
+
+def preempt_mode(*layers):
+    """The first configured layer's mechanism ('requeue', 'cancel', ...), or None if off.
+
+    An empty layer defers to the next one, as Slurm does for a QoS PreemptMode of
+    'cluster'/'OFF' or a partition without its own PreemptMode. GANG alone is
+    time slicing, not preemption.
+    """
+    for value in layers:
+        if not value:
+            continue
+        modes = [m for m in value.upper().split(",") if m not in ("", "GANG", "WITHIN")]
+        return None if not modes or "OFF" in modes else modes[0].lower()
+    return None
+
+
+def tier(rules):
+    try:
+        return int(rules.get("PriorityTier", 1))
+    except ValueError:
+        return 1
+
+
+def preemption_context(raw, partition_rules, part_hosts):
+    """What Slurm itself says about preemption; never inferred from names."""
+    config = raw.get("preempt") or {}
+    qos = None
+    if raw.get("qos") is not None:
+        qos = {
+            name: {
+                "preempt": {q for q in preempt.split(",") if q},
+                "mode": "" if mode.upper() in ("", "CLUSTER", "OFF") else mode,
+            }
+            for name, preempt, mode in split_rows(raw["qos"], 3)
+        }
+    return {
+        "type": config.get("type", "preempt/none"),
+        "mode": config.get("mode", "OFF"),
+        "qos": qos,
+        "partitions": partition_rules,
+        "hosts": part_hosts,
+    }
+
+
+def job_preemption(ctx, qos, partition, hosts=()):
+    """Whether another job may preempt one with this QoS and placement.
+
+    preempt/qos: some QoS lists this job's QoS in its Preempt field.
+    preempt/partition_prio: a higher PriorityTier partition shares its nodes.
+    The preempted job's QoS, then partition, then cluster PreemptMode must not be OFF.
+    """
+    info = {"preemptible": False, "mode": None, "by_qos": [], "by_partition": [], "source": "slurm"}
+    rules = ctx["partitions"].get(partition, {})
+    if "qos" in ctx["type"]:
+        if ctx["qos"] is None:
+            info["preemptible"] = None
+            return info
+        own = ctx["qos"].get(qos, {})
+        info["mode"] = preempt_mode(own.get("mode"), rules.get("PreemptMode"), ctx["mode"])
+        info["by_qos"] = sorted(n for n, q in ctx["qos"].items() if qos in q["preempt"])
+    elif "partition_prio" in ctx["type"]:
+        info["mode"] = preempt_mode(rules.get("PreemptMode"), ctx["mode"])
+        hosts = set(hosts) or ctx["hosts"].get(partition, set())
+        info["by_partition"] = sorted(
+            name
+            for name, other in ctx["partitions"].items()
+            if name != partition
+            and tier(other) > tier(rules)
+            and ctx["hosts"].get(name, set()) & hosts
+        )
+    info["preemptible"] = bool(info["mode"] and (info["by_qos"] or info["by_partition"]))
+    if not info["preemptible"]:
+        info.update(mode=None, by_qos=[], by_partition=[])
+    return info
+
+
+def preempt_cell(info):
+    if info["source"] == "filler":
+        return "filler"
+    if info["preemptible"] is None:
+        return "?"
+    return "yes" if info["preemptible"] else "no"
+
+
+def preempt_detail(info, model=None, partition=None):
+    """'preemptible by QoS high (requeue) · you can preempt via QoS high'."""
+    if info["source"] == "filler":
+        return "filler job: counted as reclaimable"
+    if info["source"] == "configured":
+        return "QoS configured as preemptible (--preemptible-qos)"
+    if info["preemptible"] is None:
+        return "preemption unknown: QoS table unreadable"
+    if not info["preemptible"]:
+        return "not preemptible"
+    by = ["QoS " + ",".join(info["by_qos"])] if info["by_qos"] else []
+    by += ["partition " + ",".join(info["by_partition"])] if info["by_partition"] else []
+    text = "preemptible by %s (%s)" % (" · ".join(by), info["mode"])
+    if model is not None:
+        rows = [r for r in model["rows"] if r["partition"] == partition]
+        qos = sorted({q for r in rows for q in r["qos"]} & set(info["by_qos"]))
+        parts = sorted({r["partition"] for r in model["rows"]} & set(info["by_partition"]))
+        via = (["QoS " + ",".join(qos)] if qos else []) + (
+            ["partition " + ",".join(parts)] if parts else []
+        )
+        if via:
+            text += " · you can preempt via " + " · ".join(via)
+    return text
+
+
 _LIMIT_RE = re.compile(r"(cpu|mem|node|gres/gpu)=([N0-9]+)\((\d+)\)")
 
 
@@ -444,7 +572,7 @@ def short_gpu(model, features):
 
 def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
     # -- partitions: physical truth -----------------------------------------
-    parts, node_resources = {}, {}
+    parts, node_resources, part_hosts = {}, {}, defaultdict(set)
     for host, part, state, cpustate, gres, gresused, mem, allocmem, feats in split_rows(
         raw["nodes"], 9
     ):
@@ -473,6 +601,7 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
         except ValueError:
             alloc = idle = total = 0
         node_resources[host] = {"gpu": ngpu, "cpu": total, "mem": float(mem)}
+        part_hosts[part].add(host)
         p["nodes"] += 1
         # Configured totals include down nodes: they are the right denominator
         # for "how oversubscribed is this partition structurally".
@@ -496,12 +625,16 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
         p["node"] = p["nodes"] - p["nodes_down"]
         p["is_gpu"] = p["gpu_cfg"] > 0
 
+    partition_rules = parse_partitions(raw.get("partitions", []))
+    preemption = preemption_context(raw, partition_rules, part_hosts)
+
     # -- jobs: who is using, who is waiting ---------------------------------
     pend = defaultdict(zero)  # account -> pending TRES (real contention)
     mine_run = defaultdict(zero)
     mine_pend = defaultdict(zero)
-    part_preempt = defaultdict(zero)  # partition -> TRES a normal job can reclaim
+    part_preempt = defaultdict(zero)  # partition -> TRES held by preemptible jobs
     part_filler = defaultdict(zero)  # partition -> TRES held by filler jobs
+    part_configured = defaultdict(zero)  # partition -> TRES held by --preemptible-qos jobs
     part_pend = defaultdict(zero)
     observed = defaultdict(set)
     my_jobs, running_jobs = [], []
@@ -525,6 +658,15 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
         observed[acct].add(part)
         t = parse_tres(tres)
         t["jobs"] = 1
+        hosts = set(expand_hosts(nodes)) if st == "R" else set()
+        if who in ignore_users:
+            preempt = {"preemptible": True, "mode": None, "by_qos": [], "by_partition": []}
+            preempt["source"] = "filler"
+        elif qos in preemptible_qos:
+            preempt = {"preemptible": True, "mode": None, "by_qos": [], "by_partition": []}
+            preempt["source"] = "configured"
+        else:
+            preempt = job_preemption(preemption, qos, part, hosts)
         if st == "R":
             running_jobs.append(
                 {
@@ -538,6 +680,8 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
                     "limit": limit,
                     "tres": t,
                     "nodes": nodes,
+                    "hosts": hosts,
+                    "preempt": preempt,
                 }
             )
         if who in ignore_users:
@@ -545,8 +689,10 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
                 add_into(part_filler[part], t)
             continue
         if st == "R":
-            if qos in preemptible_qos:
+            if preempt["preemptible"]:
                 add_into(part_preempt[part], t)
+            if preempt["source"] == "configured":
+                add_into(part_configured[part], t)
             if who == user:
                 add_into(mine_run[(acct, part)], t)
         elif st == "PD":
@@ -567,6 +713,7 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
                     "tres": t,
                     "left": left,
                     "name": name,
+                    "preempt": preempt,
                 }
             )
 
@@ -593,7 +740,6 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
             quota[(acct, _part)] = parse_tres(grptres)
 
     access = partition_access(raw, parents, parts)
-    partition_rules = parse_partitions(raw.get("partitions", []))
 
     # Structural oversubscription: if every account cashed its quota at once,
     # how many times over would the partition be booked?
@@ -621,7 +767,7 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
         for account in account_chain(job["account"], parents):
             key = (account, job["partition"])
             add_into(partition_usage[key], job["tres"])
-            occupied[key].update(expand_hosts(job["nodes"]))
+            occupied[key].update(job["hosts"])
     for key, hosts in occupied.items():
         partition_usage[key]["node"] = len(hosts)
 
@@ -633,6 +779,10 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
             for acct, live in usage.items()
         }
     )
+    # Jobs Slurm would preempt for someone else: candidates for reclaiming.
+    slurm_preemptible = [
+        j for j in running_jobs if j["preempt"]["source"] == "slurm" and j["preempt"]["preemptible"]
+    ]
     rows, seen = [], set()
     memberships = []
     for acct, partition, qos, grptres in split_rows(raw["mine"], 4):
@@ -678,8 +828,21 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
         preempt_used = sum(
             j["tres"][res]
             for j in running_jobs
-            if j["account"] == acct and j["partition"] == part and j["qos"] in preemptible_qos
+            if j["account"] == acct
+            and j["partition"] == part
+            and j["preempt"]["source"] != "filler"
+            and j["preempt"]["preemptible"]
         )
+        # Reclaimable: filler and configured-QoS jobs on this partition, plus jobs
+        # on this partition's nodes that Slurm lets one of our QoS/this partition preempt.
+        row_qos = {x for x in qos.split(",") if x}
+        reclaim, reclaim_qos = part_filler[part][res] + part_configured[part][res], set()
+        for j in slurm_preemptible:
+            on_part = j["partition"] == part or (j["hosts"] and j["hosts"] <= part_hosts[part])
+            via = row_qos.intersection(j["preempt"]["by_qos"])
+            if on_part and (via or part in j["preempt"]["by_partition"]):
+                reclaim += j["tres"][res]
+                reclaim_qos |= via
         rows.append(
             {
                 "account": acct,
@@ -700,7 +863,13 @@ def build(raw, user, ignore_users=FILLER_USERS, preemptible_qos=()):
                 "mine_run": mine_run.get((acct, part), zero()),
                 "mine_pend": mine_pend.get((acct, part), zero()),
                 "phys_free": pinfo[res] - pinfo[res + "_used"],
-                "reclaim": part_preempt[part][res] + part_filler[part][res],
+                "reclaim": reclaim,
+                "reclaim_qos": sorted(reclaim_qos),
+                "preemptible_qos": [
+                    q
+                    for q in sorted(row_qos)
+                    if q in preemptible_qos or job_preemption(preemption, q, part)["preemptible"]
+                ],
                 "per_node": pinfo["density"],
                 "part": pinfo,
                 "has_normal": not qos or any(q not in preemptible_qos for q in qos.split(",")),
@@ -1105,14 +1274,22 @@ def render(model, args, width):
                 st, tail = C.OK + "R" + C.RESET, C.DIM + "%s left" % j["left"] + C.RESET
             else:
                 st, tail = C.WARN + "PD" + C.RESET, C.MUTED + j["reason"] + C.RESET
+            preempt = preempt_cell(j["preempt"])
+            if preempt in ("yes", "filler"):
+                preempt = C.WARN + "preemptible" + C.RESET
+            elif preempt == "?":
+                preempt = C.DIM + "preempt ?" + C.RESET
+            else:
+                preempt = C.DIM + "·" + C.RESET
             add(
-                "  %s %s %s %s %s %s"
+                "  %s %s %s %s %s %s %s"
                 % (
                     pad(C.DIM + j["id"] + C.RESET, 9),
                     pad(st, 3),
                     pad(C.INK + j["name"][:wn] + C.RESET, wn),
                     pad(C.MUTED + j["account"] + C.RESET, wa),
                     pad(g, 5),
+                    pad(preempt, 11),
                     tail,
                 )
             )
@@ -1169,12 +1346,31 @@ def to_json(model, args):
                 "pending_jobs_in_account": r["pending"]["jobs"],
                 "partition_free": r["phys_free"],
                 "partition_reclaimable": r["reclaim"],
+                "reclaim_via_qos": r["reclaim_qos"],
+                "preemptible_qos": r["preemptible_qos"],
                 "my_running": r["mine_run"]["jobs"],
                 "my_pending": r["mine_pend"]["jobs"],
                 "status": r["verdict"][2],
                 "rank": r["verdict"][0],
             }
         )
+    out["my_jobs"] = [
+        {
+            "id": j["id"],
+            "name": j["name"],
+            "account": j["account"],
+            "partition": j["partition"],
+            "qos": j["qos"],
+            "state": j["state"],
+            "reason": j["reason"],
+            "preemptible": j["preempt"]["preemptible"],
+            "preempt_mode": j["preempt"]["mode"],
+            "preemptible_by_qos": j["preempt"]["by_qos"],
+            "preemptible_by_partition": j["preempt"]["by_partition"],
+            "preempt_source": j["preempt"]["source"],
+        }
+        for j in model["my_jobs"]
+    ]
     for p in sorted(model["parts"].values(), key=lambda x: x["name"]):
         res = "gpu" if p["is_gpu"] else "cpu"
         out["partitions"].append(
@@ -1488,6 +1684,20 @@ def node_equivalent(job, nodes):
     return {"value": value, "bound": bound, "fractions": fractions, "nodes": len(hosts)}
 
 
+JOB_HEADERS = [
+    "▾ JOBS / ID",
+    "NAME",
+    "USER",
+    "ELAPSED",
+    "LIMIT",
+    "GPUs",
+    "NODE EQ",
+    "BOUND",
+    "PREEMPT?",
+]
+PREEMPT_COLUMN = JOB_HEADERS.index("PREEMPT?")
+
+
 def running_job_rows(model, selection):
     """Select an exact partition and an account subtree, including every user."""
     if selection[0] == "other":
@@ -1540,11 +1750,14 @@ def running_job_rows(model, selection):
                     fmt_n(job["tres"]["gpu"]),
                     node_eq,
                     bound,
+                    preempt_cell(job["preempt"]),
                 ],
                 "available": 0,
                 "gpus": job["tres"]["gpu"],
                 "node_estimate": estimate,
-                "detail": "Name: " + job["name"],
+                "preemptible": bool(job["preempt"]["preemptible"]),
+                "detail": "Name: %s · %s"
+                % (job["name"], preempt_detail(job["preempt"], model, job["partition"])),
                 "limits": fractions,
                 "identity": "%s · %s · QOS %s" % (job["id"], job["account"], job["qos"]),
             }
@@ -1586,16 +1799,7 @@ def inline_rows(model, args, expanded, expanded_jobs):
                 "expandable": False,
                 "indent": indent,
                 "tree": header_tree,
-                "cells": [
-                    "▾ JOBS / ID",
-                    "NAME",
-                    "USER",
-                    "ELAPSED",
-                    "LIMIT",
-                    "GPUs",
-                    "NODE EQ",
-                    "BOUND",
-                ],
+                "cells": list(JOB_HEADERS),
                 "detail": summary,
                 "limits": row["detail"],
             }
@@ -1755,17 +1959,12 @@ def interactive(args, update_check=None):
                 account_rows = [r for r in all_rows if r["kind"] == "account"]
                 widths = column_widths(headers, account_rows, columns - 4)
                 job_rows = [r for r in entries if r["kind"] in ("job", "job_header")]
-                job_headers = [
-                    "▾ JOBS / ID",
-                    "NAME",
-                    "USER",
-                    "ELAPSED",
-                    "LIMIT",
-                    "GPUs",
-                    "NODE EQ",
-                    "BOUND",
-                ]
-                job_columns = list(range(8)) if columns >= 100 else [1, 2, 3, 4, 5, 6]
+                job_headers = list(JOB_HEADERS)
+                job_columns = (
+                    list(range(len(job_headers)))
+                    if columns >= 100
+                    else [1, 2, 3, 4, 5, 6, PREEMPT_COLUMN]
+                )
                 if columns < 100:
                     job_headers[1] = "▾ JOBS / NAME"
                 job_widths = column_widths(
@@ -1801,6 +2000,14 @@ def interactive(args, update_check=None):
                             field_attr |= curses.A_BOLD
                         if i == 4 and color and is_account and index != selected:
                             field_attr |= curses.color_pair(2 if row["available"] else 3)
+                        if (
+                            row["kind"] == "job"
+                            and job_columns[i] == PREEMPT_COLUMN
+                            and row["preemptible"]
+                            and color
+                            and index != selected
+                        ):
+                            field_attr |= curses.color_pair(3)
                         value = clip(cells[i], w).ljust(w)
                         if i == 0 and is_account and row["parent"]:
                             put(y, x, value[:2], attr | curses.A_DIM)
@@ -1832,7 +2039,7 @@ def interactive(args, update_check=None):
                     "Enter jobs | Space expand | x favorite | Left back | r refresh | q quit",
                 )
                 note = (
-                    "NODE EQ ≈ max(GPU, CPU, host RAM share); actual packing can differ."
+                    "NODE EQ ≈ max(GPU, CPU, host RAM share); PREEMPT? from Slurm's config."
                     if expanded_jobs
                     else ""
                 )
