@@ -38,8 +38,12 @@ wtf -c              # CPU partitions
 wtf -m research     # filter account or partition names
 wtf --plain         # printable snapshot
 wtf --json          # machine-readable snapshot
-wtf -w 30           # refresh every 30 seconds
+wtf -w 30           # refresh every 30 seconds (also 90s, 2.5m, 1h)
 ```
+
+The live view refreshes every 2.5 minutes by default; press `r` to refresh now.
+Set `SLURM_WTF_REFRESH` (for example `export SLURM_WTF_REFRESH=5m`) to change the
+default persistently; `-w` overrides it for one invocation.
 
 | Action | Control |
 |---|---|

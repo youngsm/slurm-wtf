@@ -47,6 +47,27 @@ class C(object):
                 setattr(cls, k, "")
 
 
+DEFAULT_REFRESH = 150.0  # seconds between automatic refreshes
+MIN_REFRESH = 2.0
+_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600}
+
+
+def parse_interval(text):
+    """'150', '90s', '2.5m', or '1h' -> seconds (at least MIN_REFRESH)."""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d*)?|\.\d+)\s*([smh]?)\s*", str(text).lower())
+    if not match:
+        raise argparse.ArgumentTypeError(
+            "invalid interval %r (try 150, 90s, 2.5m, or 1h)" % (text,)
+        )
+    return max(MIN_REFRESH, float(match.group(1)) * _UNITS[match.group(2)])
+
+
+def format_interval(seconds):
+    if seconds >= 60 and seconds % 6 == 0:
+        return "%gm" % (seconds / 60)
+    return "%gs" % seconds
+
+
 BLOCKS = " ▏▎▍▌▋▊▉█"
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
@@ -1888,7 +1909,7 @@ def interactive(args, update_check=None):
         expanded_jobs = set()
         selected, offset, selected_key = 0, 0, None
         next_refresh, stamp = 0, ""
-        interval = max(2, args.watch if args.watch is not None else 20)
+        interval = args.watch or getattr(args, "default_refresh", DEFAULT_REFRESH)
 
         def refresh():
             def fetch():
@@ -2187,10 +2208,11 @@ def main(argv=None):
         "-w",
         "--watch",
         nargs="?",
-        const=20,
-        type=int,
-        metavar="SEC",
-        help="refresh interval; also enables watching --plain output (default 20s)",
+        const=0,  # bare -w: use the default interval
+        type=parse_interval,
+        metavar="INTERVAL",
+        help="refresh interval such as 150, 90s, or 2.5m; also enables watching --plain "
+        "output (default 2.5m, or $SLURM_WTF_REFRESH)",
     )
     ap.add_argument("-g", "--gpu", dest="gpu_only", action="store_true", help="GPU partitions only")
     ap.add_argument(
@@ -2250,6 +2272,15 @@ def main(argv=None):
         except re.error as exc:
             ap.error("invalid --match expression: " + str(exc))
 
+    try:
+        args.default_refresh = parse_interval(
+            os.environ.get("SLURM_WTF_REFRESH") or DEFAULT_REFRESH
+        )
+    except argparse.ArgumentTypeError as exc:
+        ap.error("SLURM_WTF_REFRESH: " + str(exc))
+    if args.watch == 0:
+        args.watch = args.default_refresh
+
     if args.no_color or os.environ.get("NO_COLOR") or (not args.json and not sys.stdout.isatty()):
         C.strip()
 
@@ -2292,7 +2323,7 @@ def main(argv=None):
                 print(update_check.notice, file=sys.stderr)
         return 0
 
-    interval = max(2, args.watch)
+    interval = args.watch
     sys.stdout.write("\033[?1049h\033[?25l")
     try:
         while True:
@@ -2301,7 +2332,8 @@ def main(argv=None):
             if update_check and update_check.notice:
                 sys.stdout.write("\n " + update_check.notice)
             sys.stdout.write(
-                "\n %srefreshing every %ds · ctrl-c to quit%s\n" % (C.DIM, interval, C.RESET)
+                "\n %srefreshing every %s · ctrl-c to quit%s\n"
+                % (C.DIM, format_interval(interval), C.RESET)
             )
             sys.stdout.flush()
             time.sleep(interval)
